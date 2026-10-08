@@ -4,8 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -65,6 +67,7 @@ fun SceneChipRow(
 fun PosePickerRow(
     poses: List<PoseCard>,
     selectedId: String?,
+    recommendedId: String? = null,
     onSelect: (PoseCard) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -77,6 +80,7 @@ fun PosePickerRow(
             PosePickerItem(
                 pose = pose,
                 selected = pose.id == selectedId,
+                recommended = pose.id == recommendedId,
                 onClick = { onSelect(pose) },
             )
         }
@@ -87,6 +91,7 @@ fun PosePickerRow(
 private fun PosePickerItem(
     pose: PoseCard,
     selected: Boolean,
+    recommended: Boolean,
     onClick: () -> Unit,
 ) {
     Column(
@@ -96,10 +101,7 @@ private fun PosePickerItem(
         verticalArrangement = Arrangement.spacedBy(4.dp),
         horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
     ) {
-        AsyncImage(
-            model = "file:///android_asset/poses/${pose.id}.jpg",
-            contentDescription = pose.name,
-            contentScale = ContentScale.Crop,
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(3f / 4f)
@@ -110,7 +112,26 @@ private fun PosePickerItem(
                     color = if (selected) SELECTED_BORDER else Color.White.copy(alpha = 0.25f),
                     shape = RoundedCornerShape(10.dp),
                 ),
-        )
+        ) {
+            AsyncImage(
+                model = "file:///android_asset/poses/${pose.id}.jpg",
+                contentDescription = pose.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+            if (recommended) {
+                Text(
+                    text = "AI 推荐",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier
+                        .align(androidx.compose.ui.Alignment.TopStart)
+                        .padding(4.dp)
+                        .background(SELECTED_BORDER, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                )
+            }
+        }
         Text(
             text = pose.name,
             style = MaterialTheme.typography.labelMedium,

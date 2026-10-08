@@ -35,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,6 +57,7 @@ import com.aicompose.core.vision.CompositionResult
 import com.aicompose.core.vision.scene.PoseCatalog
 import com.aicompose.core.vision.scene.Scene
 import com.aicompose.core.vision.scene.SceneDetector
+import com.aicompose.core.vision.scene.SceneHit
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 
@@ -75,10 +77,12 @@ fun CameraScreen() {
     }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
 
-    // 场景识别状态: autoScene 是实时识别结果, manualScene 是用户手选 (优先级更高)
-    var autoScene by remember { mutableStateOf<Scene?>(null) }
+    // 场景识别状态: autoHit 是实时识别结果 (含命中标签与置信度), manualScene 是用户手选 (优先级更高)
+    var autoHit by remember { mutableStateOf<SceneHit?>(null) }
     var manualScene by remember { mutableStateOf<Scene?>(null) }
     var selectedPoseId by remember { mutableStateOf<String?>(null) }
+    // 记住上次生效的场景, 用于「识别到新场景就自动推荐姿势」
+    var lastAppliedSceneKey by remember { mutableStateOf<String?>(null) }
 
     // 拍照结果状态
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -113,11 +117,20 @@ fun CameraScreen() {
         return
     }
 
-    val effectiveScene = manualScene ?: autoScene
+    val effectiveScene = manualScene ?: autoHit?.scene
     val poses = effectiveScene?.let { PoseCatalog.of(it) } ?: emptyList()
     val selectedPose = PoseCatalog.byId(selectedPoseId)?.takeIf { it.scene == effectiveScene }
     val silhouette = remember(selectedPose?.id) {
         selectedPose?.let { loadSilhouette(context, it.id) }
+    }
+
+    // 场景一变就自动推荐该场景的第一个姿势 (AI 推荐), 用户手动换姿势后不再打扰
+    LaunchedEffect(effectiveScene?.key) {
+        val scene = effectiveScene ?: return@LaunchedEffect
+        if (lastAppliedSceneKey != scene.key) {
+            lastAppliedSceneKey = scene.key
+            selectedPoseId = PoseCatalog.of(scene).firstOrNull()?.id
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -157,7 +170,7 @@ fun CameraScreen() {
                                 sceneDetector.classifyAsync(
                                     mediaImage = media,
                                     rotationDegrees = rot,
-                                    onResult = { scene -> if (scene != null) autoScene = scene },
+                                    onResult = { hit -> if (hit != null) autoHit = hit },
                                     onComplete = { proxy.close() },
                                 )
                             }
@@ -184,8 +197,19 @@ fun CameraScreen() {
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // 左上角: 识别到的场景
-            val sceneLabel = effectiveScene?.let { "${it.emoji} ${it.displayName}" } ?: "识别中…"
+            // 左上角: 识别到的场景 + 命中标签与置信度
+            val sceneLabel = buildString {
+                when {
+                    effectiveScene != null -> append("${effectiveScene.emoji} ${effectiveScene.displayName}")
+                    autoHit != null -> append("识别中…")
+                    else -> append("识别中…")
+                }
+                autoHit?.let { h ->
+                    if (h.label != null && h.scene == effectiveScene) {
+                        append(" · ${h.label} ${(h.confidence * 100).toInt()}%")
+                    }
+                }
+            }
             Text(
                 text = sceneLabel,
                 color = Color.White,
@@ -197,9 +221,9 @@ fun CameraScreen() {
                     .padding(horizontal = 12.dp, vertical = 6.dp),
             )
 
-            // 底部: 当前姿势说明
+            // 底部: 当前姿势说明 (AI 自动推荐或用户自选)
             val caption = when {
-                selectedPose != null -> "${selectedPose.name} · ${selectedPose.summary}"
+                selectedPose != null -> "✨ AI 推荐 · ${selectedPose.name}：${selectedPose.summary}"
                 effectiveScene != null -> effectiveScene.hint
                 else -> "把镜头对准场景，正在识别…"
             }
@@ -217,12 +241,12 @@ fun CameraScreen() {
 
         SceneChipRow(
             selected = manualScene,
-            auto = autoScene,
+            auto = autoHit?.scene,
             onSelect = { scene ->
                 manualScene = scene
                 // 换场景时清掉不属于新场景的选中姿势
                 val pose = PoseCatalog.byId(selectedPoseId)
-                if (pose != null && pose.scene != (scene ?: autoScene)) selectedPoseId = null
+                if (pose != null && pose.scene != (scene ?: autoHit?.scene)) selectedPoseId = null
             },
             modifier = Modifier.padding(top = 10.dp),
         )
@@ -231,6 +255,7 @@ fun CameraScreen() {
             PosePickerRow(
                 poses = poses,
                 selectedId = selectedPose?.id,
+                recommendedId = poses.firstOrNull()?.id,
                 onSelect = { pose ->
                     selectedPoseId = if (selectedPoseId == pose.id) null else pose.id
                 },
