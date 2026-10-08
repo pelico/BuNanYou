@@ -8,6 +8,8 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
 /**
@@ -30,8 +32,10 @@ class GaicOnnxAnalyzer(
     init {
         val options = OrtSession.SessionOptions()
         options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        // 启用 NNAPI 加速 (Android 8.1+), 失败自动回退 CPU
-        options.addNnapi()
+        options.setIntraOpNumThreads(4)
+        // 注意: 此处刻意不使用 NNAPI。模型输入为动态尺寸, NNAPI EP 在这种场景下会
+        // 触发 native 层 SIGSEGV (进程直接闪退, Java 层无法捕获)。移动端 CPU 推理
+        // 已足够快, 稳定性优先。
         session = env.createSession(loadModelFromAssets(context, modelAssetName), options)
     }
 
@@ -56,8 +60,8 @@ class GaicOnnxAnalyzer(
         val imageShape = longArrayOf(1, 3, pre.resizedHeight.toLong(), pre.resizedWidth.toLong())
         val roiShape = longArrayOf(roiCount.toLong(), 5)
 
-        val imageTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(pre.chwFloat), imageShape)
-        val roiTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(roiArray), roiShape)
+        val imageTensor = OnnxTensor.createTensor(env, toDirectBuffer(pre.chwFloat), imageShape)
+        val roiTensor = OnnxTensor.createTensor(env, toDirectBuffer(roiArray), roiShape)
 
         val inputs = mapOf(
             "image" to imageTensor,
@@ -102,7 +106,16 @@ class GaicOnnxAnalyzer(
 
     fun close() {
         session.close()
-        env.close()
+    }
+
+    /** ONNX Runtime 的 Java 张量要求 direct buffer, 堆内 buffer 会读越界导致崩溃。 */
+    private fun toDirectBuffer(arr: FloatArray): FloatBuffer {
+        val fb = ByteBuffer.allocateDirect(arr.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        fb.put(arr)
+        fb.rewind()
+        return fb
     }
 
     private fun loadModelFromAssets(context: Context, name: String): ByteArray {

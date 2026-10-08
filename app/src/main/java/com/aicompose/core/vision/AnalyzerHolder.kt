@@ -1,6 +1,9 @@
 package com.aicompose.core.vision
 
 import android.content.Context
+import android.graphics.Bitmap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 分析器单例持有者 —— 统一管理本地 / 云端实现的切换。
@@ -23,5 +26,16 @@ object AnalyzerHolder {
         return local ?: synchronized(this) {
             local ?: GaicOnnxAnalyzer(context.applicationContext).also { local = it }
         }
+    }
+
+    /**
+     * 便捷入口: 在后台线程构建分析器并分析。
+     *
+     * 分析器首次构建要读取 12MB 模型并初始化 ONNX 会话, 必须放在后台线程,
+     * 否则会阻塞主线程甚至触发 ANR。
+     */
+    suspend fun analyze(context: Context, bitmap: Bitmap): CompositionResult {
+        val analyzer = withContext(Dispatchers.Default) { get(context) }
+        return analyzer.analyze(bitmap)
     }
 }

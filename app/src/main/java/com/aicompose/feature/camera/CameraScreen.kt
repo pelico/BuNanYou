@@ -64,6 +64,7 @@ fun CameraScreen() {
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var result by remember { mutableStateOf<CompositionResult?>(null) }
     var isAnalyzing by remember { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -94,7 +95,10 @@ fun CameraScreen() {
                         val preview = Preview.Builder().build().also {
                             it.setSurfaceProvider(previewView.surfaceProvider)
                         }
-                        val capture = ImageCapture.Builder().build()
+                        val capture = ImageCapture.Builder()
+                            // 1.3.x 默认输出格式即 JPEG, 可直接解码为 Bitmap
+                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                            .build()
                         imageCapture = capture
                         val selector = CameraSelector.DEFAULT_BACK_CAMERA
                         try {
@@ -117,22 +121,47 @@ fun CameraScreen() {
         ) {
             Button(
                 onClick = {
-                    val capture = imageCapture ?: return@Button
+                    val capture = imageCapture
+                    if (capture == null) {
+                        errorMsg = "相机尚未就绪, 请稍候再试"
+                        return@Button
+                    }
                     isAnalyzing = true
+                    errorMsg = null
                     capture.takePicture(
                         ContextCompat.getMainExecutor(context),
                         object : ImageCapture.OnImageCapturedCallback() {
                             override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
-                                val bmp = imageProxyToBitmap(image)
-                                image.close()
-                                capturedBitmap = bmp
-                                scope.launch {
-                                    result = AnalyzerHolder.get(context).analyze(bmp)
+                                val decoded = try {
+                                    imageProxyToBitmap(image)
+                                } catch (t: Throwable) {
+                                    null
+                                } finally {
+                                    image.close()
+                                }
+                                if (decoded == null) {
                                     isAnalyzing = false
+                                    errorMsg = "照片解析失败, 请重试"
+                                    return
+                                }
+                                // 相机原图通常 12MP 级别, 直接上屏/推理会 OOM, 先降采样
+                                val bmp = downscale(decoded)
+                                capturedBitmap = bmp
+                                result = null
+                                scope.launch {
+                                    try {
+                                        result = AnalyzerHolder.analyze(context, bmp)
+                                    } catch (t: Throwable) {
+                                        errorMsg = "分析失败: ${t.message ?: t.javaClass.simpleName}"
+                                    } finally {
+                                        isAnalyzing = false
+                                    }
                                 }
                             }
+
                             override fun onError(exc: ImageCaptureException) {
                                 isAnalyzing = false
+                                errorMsg = "拍照失败: ${exc.message}"
                             }
                         }
                     )
@@ -143,6 +172,15 @@ fun CameraScreen() {
             if (isAnalyzing) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp))
             }
+        }
+
+        errorMsg?.let { msg ->
+            Text(
+                msg,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
         }
 
         capturedBitmap?.let { bmp ->
@@ -177,9 +215,24 @@ private fun RuleOfThirdsOverlay() {
     }
 }
 
-private fun imageProxyToBitmap(image: androidx.camera.core.ImageProxy): Bitmap {
-    val buffer = image.planes[0].buffer
+private fun imageProxyToBitmap(image: androidx.camera.core.ImageProxy): Bitmap? {
+    val planes = image.planes
+    if (planes.isEmpty()) return null
+    val buffer = planes[0].buffer
     val bytes = ByteArray(buffer.remaining())
     buffer.get(bytes)
+    if (bytes.isEmpty()) return null
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+}
+
+/** 把长边限制到 maxSide 以内, 避免全分辨率大图导致 OOM。 */
+private fun downscale(src: Bitmap, maxSide: Int = 2048): Bitmap {
+    val longSide = maxOf(src.width, src.height)
+    if (longSide <= maxSide) return src
+    val scale = maxSide.toFloat() / longSide
+    val w = (src.width * scale).toInt().coerceAtLeast(1)
+    val h = (src.height * scale).toInt().coerceAtLeast(1)
+    val scaled = Bitmap.createScaledBitmap(src, w, h, true)
+    if (scaled != src) src.recycle()
+    return scaled
 }

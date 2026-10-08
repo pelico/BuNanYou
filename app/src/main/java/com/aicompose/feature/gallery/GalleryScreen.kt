@@ -53,6 +53,7 @@ fun GalleryScreen() {
     var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var result by remember { mutableStateOf<CompositionResult?>(null) }
     var isAnalyzing by remember { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
@@ -81,8 +82,14 @@ fun GalleryScreen() {
                     val bmp = sourceBitmap ?: return@OutlinedButton
                     scope.launch {
                         isAnalyzing = true
-                        result = AnalyzerHolder.get(context).analyze(bmp)
-                        isAnalyzing = false
+                        errorMsg = null
+                        try {
+                            result = AnalyzerHolder.analyze(context, bmp)
+                        } catch (t: Throwable) {
+                            errorMsg = "分析失败: ${t.message ?: t.javaClass.simpleName}"
+                        } finally {
+                            isAnalyzing = false
+                        }
                     }
                 },
                 enabled = sourceBitmap != null && !isAnalyzing,
@@ -97,6 +104,10 @@ fun GalleryScreen() {
                 CircularProgressIndicator(modifier = Modifier.height(20.dp).width(20.dp))
                 Text("分析中…", style = MaterialTheme.typography.bodyMedium)
             }
+        }
+
+        errorMsg?.let { msg ->
+            Text(msg, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
         }
 
         sourceBitmap?.let { bmp ->
