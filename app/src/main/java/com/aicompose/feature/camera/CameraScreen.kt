@@ -1,6 +1,7 @@
 package com.aicompose.feature.camera
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -17,6 +18,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,11 +28,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -43,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -52,18 +53,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.aicompose.core.vision.AnalyzerHolder
 import com.aicompose.core.vision.CompositionResult
-import com.aicompose.core.vision.pose.AdviceLevel
-import com.aicompose.core.vision.pose.DetectedPose
-import com.aicompose.core.vision.pose.PoseAdvice
-import com.aicompose.core.vision.pose.PoseCoach
-import com.aicompose.core.vision.pose.PoseEstimator
-import com.aicompose.core.vision.pose.PoseTemplate
-import com.aicompose.core.vision.pose.PoseTemplates
-import com.aicompose.feature.pose.AdvicePanel
-import com.aicompose.feature.pose.PoseOverlay
-import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
+import com.aicompose.core.vision.scene.PoseCatalog
+import com.aicompose.core.vision.scene.Scene
+import com.aicompose.core.vision.scene.SceneDetector
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
+
+private const val SCENE_INTERVAL_MS = 700L
 
 @ExperimentalGetImage
 @Composable
@@ -79,29 +75,22 @@ fun CameraScreen() {
     }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
 
-    // 实时取景状态
-    var livePose by remember { mutableStateOf<DetectedPose?>(null) }
-    var liveAdvice by remember { mutableStateOf<List<PoseAdvice>>(emptyList()) }
-    var contentWidth by remember { mutableStateOf(0) }
-    var contentHeight by remember { mutableStateOf(0) }
-    var selectedTemplateId by remember { mutableStateOf<String?>(null) }
+    // 场景识别状态: autoScene 是实时识别结果, manualScene 是用户手选 (优先级更高)
+    var autoScene by remember { mutableStateOf<Scene?>(null) }
+    var manualScene by remember { mutableStateOf<Scene?>(null) }
+    var selectedPoseId by remember { mutableStateOf<String?>(null) }
 
     // 拍照结果状态
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var cropResult by remember { mutableStateOf<CompositionResult?>(null) }
-    var photoPose by remember { mutableStateOf<DetectedPose?>(null) }
-    var photoAdvice by remember { mutableStateOf<List<PoseAdvice>>(emptyList()) }
     var isAnalyzing by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    // 实时用流式模式, 拍照用单图模式
-    val liveEstimator = remember { PoseEstimator(PoseDetectorOptions.STREAM_MODE) }
-    val photoEstimator = remember { PoseEstimator(PoseDetectorOptions.SINGLE_IMAGE_MODE) }
+    val sceneDetector = remember { SceneDetector() }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     DisposableEffect(Unit) {
         onDispose {
-            liveEstimator.close()
-            photoEstimator.close()
+            sceneDetector.close()
             analysisExecutor.shutdown()
         }
     }
@@ -124,18 +113,14 @@ fun CameraScreen() {
         return
     }
 
-    // 没手动选模板时, 自动推荐最接近当前姿势的一个
-    val autoTarget: PoseTemplate? = remember(livePose) {
-        livePose?.let { PoseCoach.rankTemplates(it).firstOrNull()?.first }
-    }
-    val targetTemplate = PoseTemplates.byId(selectedTemplateId) ?: autoTarget
-    val matchScore: Float? = remember(livePose, targetTemplate) {
-        val p = livePose ?: return@remember null
-        val t = targetTemplate ?: return@remember null
-        PoseCoach.rankTemplates(p).firstOrNull { it.first.id == t.id }?.second
+    val effectiveScene = manualScene ?: autoScene
+    val poses = effectiveScene?.let { PoseCatalog.of(it) } ?: emptyList()
+    val selectedPose = PoseCatalog.byId(selectedPoseId)?.takeIf { it.scene == effectiveScene }
+    val silhouette = remember(selectedPose?.id) {
+        selectedPose?.let { loadSilhouette(context, it.id) }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         Box(modifier = Modifier.weight(1f)) {
             AndroidView(
                 factory = { ctx ->
@@ -162,22 +147,17 @@ fun CameraScreen() {
                             analysis.setAnalyzer(analysisExecutor) { proxy ->
                                 val media = proxy.image
                                 val now = System.currentTimeMillis()
-                                // 限流到 ~8fps, 够用又不烫手
-                                if (media == null || now - lastTs < 120) {
+                                // 场景识别不需要很频繁, 限流到 ~1.4fps, 够用又不烫手
+                                if (media == null || now - lastTs < SCENE_INTERVAL_MS) {
                                     proxy.close()
                                     return@setAnalyzer
                                 }
                                 lastTs = now
                                 val rot = proxy.imageInfo.rotationDegrees
-                                contentWidth = if (rot == 90 || rot == 270) proxy.height else proxy.width
-                                contentHeight = if (rot == 90 || rot == 270) proxy.width else proxy.height
-                                liveEstimator.detectAsync(
+                                sceneDetector.classifyAsync(
                                     mediaImage = media,
                                     rotationDegrees = rot,
-                                    onResult = { p ->
-                                        livePose = p
-                                        liveAdvice = p?.let { PoseCoach.buildAdvice(it) } ?: emptyList()
-                                    },
+                                    onResult = { scene -> if (scene != null) autoScene = scene },
                                     onComplete = { proxy.close() },
                                 )
                             }
@@ -198,57 +178,64 @@ fun CameraScreen() {
                 modifier = Modifier.fillMaxSize(),
             )
 
-            PoseOverlay(
-                pose = livePose,
-                target = targetTemplate,
-                contentWidth = contentWidth,
-                contentHeight = contentHeight,
-                fillCenter = true,
+            SilhouetteOverlay(
+                silhouette = silhouette,
                 drawThirds = true,
                 modifier = Modifier.fillMaxSize(),
             )
 
-            AdvicePanel(
-                advice = liveAdvice,
-                modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
+            // 左上角: 识别到的场景
+            val sceneLabel = effectiveScene?.let { "${it.emoji} ${it.displayName}" } ?: "识别中…"
+            Text(
+                text = sceneLabel,
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(12.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
             )
 
-            val caption = buildString {
-                if (targetTemplate != null) {
-                    append("参考姿势：${targetTemplate.name}")
-                    if (matchScore != null) append("  匹配 ${(matchScore * 100).toInt()}%")
-                }
+            // 底部: 当前姿势说明
+            val caption = when {
+                selectedPose != null -> "${selectedPose.name} · ${selectedPose.summary}"
+                effectiveScene != null -> effectiveScene.hint
+                else -> "把镜头对准场景，正在识别…"
             }
-            if (caption.isNotEmpty()) {
-                Text(
-                    text = caption,
-                    color = Color(0xFFFFC857),
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(12.dp),
-                )
-            }
+            Text(
+                text = caption,
+                color = Color(0xFFFFC857),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(12.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
         }
 
-        LazyRow(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            item {
-                FilterChip(
-                    selected = selectedTemplateId == null,
-                    onClick = { selectedTemplateId = null },
-                    label = { Text("自动") },
-                )
-            }
-            items(PoseTemplates.ALL, key = { it.id }) { t ->
-                FilterChip(
-                    selected = selectedTemplateId == t.id,
-                    onClick = { selectedTemplateId = t.id },
-                    label = { Text(t.name) },
-                )
-            }
+        SceneChipRow(
+            selected = manualScene,
+            auto = autoScene,
+            onSelect = { scene ->
+                manualScene = scene
+                // 换场景时清掉不属于新场景的选中姿势
+                val pose = PoseCatalog.byId(selectedPoseId)
+                if (pose != null && pose.scene != (scene ?: autoScene)) selectedPoseId = null
+            },
+            modifier = Modifier.padding(top = 10.dp),
+        )
+
+        if (poses.isNotEmpty()) {
+            PosePickerRow(
+                poses = poses,
+                selectedId = selectedPose?.id,
+                onSelect = { pose ->
+                    selectedPoseId = if (selectedPoseId == pose.id) null else pose.id
+                },
+                modifier = Modifier.padding(top = 10.dp),
+            )
         }
 
         Row(
@@ -285,15 +272,9 @@ fun CameraScreen() {
                                 val bmp = downscale(decoded)
                                 capturedBitmap = bmp
                                 cropResult = null
-                                photoPose = null
-                                photoAdvice = emptyList()
                                 scope.launch {
                                     try {
                                         cropResult = AnalyzerHolder.analyze(context, bmp)
-                                        val p = photoEstimator.detect(bmp)
-                                        photoPose = p
-                                        photoAdvice = p?.let { PoseCoach.buildAdvice(it) }
-                                            ?: listOf(PoseAdvice(AdviceLevel.WARN, "没检测到人物，请让被拍者完整进入画面"))
                                     } catch (t: Throwable) {
                                         errorMsg = "分析失败: ${t.message ?: t.javaClass.simpleName}"
                                     } finally {
@@ -348,25 +329,22 @@ fun CameraScreen() {
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit,
                     )
-                    PoseOverlay(
-                        pose = photoPose,
-                        target = photoPose?.let { p ->
-                            PoseTemplates.byId(selectedTemplateId)
-                                ?: PoseCoach.rankTemplates(p).firstOrNull()?.first
-                        },
-                        contentWidth = bmp.width,
-                        contentHeight = bmp.height,
-                        fillCenter = false,
-                        drawThirds = false,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-                if (photoAdvice.isNotEmpty()) {
-                    AdvicePanel(advice = photoAdvice, modifier = Modifier.fillMaxWidth())
                 }
             }
         }
     }
+}
+
+/** 剪影素材很小 (十几 KB), 直接同步解码, 用 map 缓存避免重复 IO。 */
+private val silhouetteCache = HashMap<String, ImageBitmap?>()
+
+private fun loadSilhouette(context: Context, id: String): ImageBitmap? {
+    if (silhouetteCache.containsKey(id)) return silhouetteCache[id]
+    val bitmap = runCatching {
+        context.assets.open("poses/$id.png").use { BitmapFactory.decodeStream(it)?.asImageBitmap() }
+    }.getOrNull()
+    silhouetteCache[id] = bitmap
+    return bitmap
 }
 
 private fun imageProxyToBitmap(image: androidx.camera.core.ImageProxy): Bitmap? {

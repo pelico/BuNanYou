@@ -11,8 +11,8 @@ android {
         applicationId = "com.aicompose"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 5
+        versionName = "0.4.0"
         ndk {
             // 只打包 arm64-v8a, 大幅缩减 APK 体积 (现代安卓手机主流架构)
             abiFilters += listOf("arm64-v8a")
@@ -86,8 +86,8 @@ dependencies {
     // ONNX Runtime Mobile — 端侧推理
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
-    // ML Kit 姿态检测 — 端侧人体关键点 (离线, 无需 API Key)
-    implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+    // ML Kit 图像标签 — 端侧场景识别 (离线, 无需 API Key)
+    implementation("com.google.mlkit:image-labeling:17.0.8")
 
     // CameraX — 实时取景
     val cameraxVersion = "1.3.2"
