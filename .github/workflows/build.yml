@@ -1,9 +1,12 @@
-name: Build Debug APK
+name: Build & Release APK
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -23,12 +26,40 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
 
-      - name: Upload APK
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk \
+             "dist/aicompose-v${{ steps.version.outputs.version }}.apk"
+          ls -lh dist
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: app-release
+          path: dist/*.apk
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: AICompose v${{ steps.version.outputs.version }}
+          body: |
+            自动构建的**已签名** APK，可直接覆盖安装升级（无需卸载重装）。
+
+            - 版本: v${{ steps.version.outputs.version }}
+            - 架构: arm64-v8a
+            - 签名: 固定 release 签名
+          files: dist/*.apk
+          fail_on_unmatched_files: true

@@ -11,11 +11,21 @@ android {
         applicationId = "com.aicompose"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk {
             // 只打包 arm64-v8a, 大幅缩减 APK 体积 (现代安卓手机主流架构)
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        // 固定签名: 保证每次 CI 构建出的 APK 签名一致, 可直接覆盖升级
+        create("release") {
+            storeFile = rootProject.file("keystore/aicompose-release.jks")
+            storePassword = "aicompose"
+            keyAlias = "aicompose"
+            keyPassword = "aicompose"
         }
     }
 
@@ -26,6 +36,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
+        }
+        debug {
+            // debug 也用同一签名, 便于 debug/release 互相覆盖升级
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
