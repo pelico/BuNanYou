@@ -25,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,6 +44,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.aicompose.core.vision.AnalyzerHolder
 import com.aicompose.core.vision.CompositionResult
+import com.aicompose.core.vision.pose.AdviceLevel
+import com.aicompose.core.vision.pose.DetectedPose
+import com.aicompose.core.vision.pose.PoseAdvice
+import com.aicompose.core.vision.pose.PoseCoach
+import com.aicompose.core.vision.pose.PoseEstimator
+import com.aicompose.feature.pose.AdvicePanel
+import com.aicompose.feature.pose.PoseOverlay
+import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
 import kotlinx.coroutines.launch
 
 @Composable
@@ -54,6 +63,13 @@ fun GalleryScreen() {
     var result by remember { mutableStateOf<CompositionResult?>(null) }
     var isAnalyzing by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
+    var pose by remember { mutableStateOf<DetectedPose?>(null) }
+    var advice by remember { mutableStateOf<List<PoseAdvice>>(emptyList()) }
+
+    val poseEstimator = remember { PoseEstimator(PoseDetectorOptions.SINGLE_IMAGE_MODE) }
+    DisposableEffect(Unit) {
+        onDispose { poseEstimator.close() }
+    }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
@@ -63,6 +79,9 @@ fun GalleryScreen() {
             val bitmap = loadBitmap(context, uri) ?: return@launch
             sourceBitmap = bitmap
             result = null
+            pose = null
+            advice = emptyList()
+            errorMsg = null
         }
     }
 
@@ -85,6 +104,10 @@ fun GalleryScreen() {
                         errorMsg = null
                         try {
                             result = AnalyzerHolder.analyze(context, bmp)
+                            val p = poseEstimator.detect(bmp)
+                            pose = p
+                            advice = p?.let { PoseCoach.buildAdvice(it) }
+                                ?: listOf(PoseAdvice(AdviceLevel.WARN, "没检测到人物，换个角度或让人物更完整地出现在画面里"))
                         } catch (t: Throwable) {
                             errorMsg = "分析失败: ${t.message ?: t.javaClass.simpleName}"
                         } finally {
@@ -126,6 +149,26 @@ fun GalleryScreen() {
                         imageHeight = bmp.height,
                     )
                 }
+                PoseOverlay(
+                    pose = pose,
+                    target = pose?.let { p -> PoseCoach.rankTemplates(p).firstOrNull()?.first },
+                    contentWidth = bmp.width,
+                    contentHeight = bmp.height,
+                    fillCenter = false,
+                    drawThirds = false,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            if (advice.isNotEmpty()) {
+                val best = pose?.let { p -> PoseCoach.rankTemplates(p).firstOrNull() }
+                if (best != null) {
+                    Text(
+                        "参考姿势：${best.first.name}   匹配 ${(best.second * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                AdvicePanel(advice = advice, modifier = Modifier.fillMaxWidth())
             }
 
             result?.let { r ->

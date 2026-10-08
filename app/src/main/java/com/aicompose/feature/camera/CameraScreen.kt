@@ -3,30 +3,38 @@ package com.aicompose.feature.camera
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.RectF
+import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,7 +42,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -45,10 +52,20 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.aicompose.core.vision.AnalyzerHolder
 import com.aicompose.core.vision.CompositionResult
+import com.aicompose.core.vision.pose.AdviceLevel
+import com.aicompose.core.vision.pose.DetectedPose
+import com.aicompose.core.vision.pose.PoseAdvice
+import com.aicompose.core.vision.pose.PoseCoach
+import com.aicompose.core.vision.pose.PoseEstimator
+import com.aicompose.core.vision.pose.PoseTemplate
+import com.aicompose.core.vision.pose.PoseTemplates
+import com.aicompose.feature.pose.AdvicePanel
+import com.aicompose.feature.pose.PoseOverlay
+import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
-import android.graphics.BitmapFactory
+import java.util.concurrent.Executors
 
+@ExperimentalGetImage
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
@@ -61,10 +78,33 @@ fun CameraScreen() {
         )
     }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
+
+    // 实时取景状态
+    var livePose by remember { mutableStateOf<DetectedPose?>(null) }
+    var liveAdvice by remember { mutableStateOf<List<PoseAdvice>>(emptyList()) }
+    var contentWidth by remember { mutableStateOf(0) }
+    var contentHeight by remember { mutableStateOf(0) }
+    var selectedTemplateId by remember { mutableStateOf<String?>(null) }
+
+    // 拍照结果状态
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var result by remember { mutableStateOf<CompositionResult?>(null) }
+    var cropResult by remember { mutableStateOf<CompositionResult?>(null) }
+    var photoPose by remember { mutableStateOf<DetectedPose?>(null) }
+    var photoAdvice by remember { mutableStateOf<List<PoseAdvice>>(emptyList()) }
     var isAnalyzing by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    // 实时用流式模式, 拍照用单图模式
+    val liveEstimator = remember { PoseEstimator(PoseDetectorOptions.STREAM_MODE) }
+    val photoEstimator = remember { PoseEstimator(PoseDetectorOptions.SINGLE_IMAGE_MODE) }
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(Unit) {
+        onDispose {
+            liveEstimator.close()
+            photoEstimator.close()
+            analysisExecutor.shutdown()
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -76,12 +116,23 @@ fun CameraScreen() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("需要相机权限来提供实时构图提示")
+            Text("需要相机权限来提供实时构图与姿势提示")
             Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
                 Text("授权相机")
             }
         }
         return
+    }
+
+    // 没手动选模板时, 自动推荐最接近当前姿势的一个
+    val autoTarget: PoseTemplate? = remember(livePose) {
+        livePose?.let { PoseCoach.rankTemplates(it).firstOrNull()?.first }
+    }
+    val targetTemplate = PoseTemplates.byId(selectedTemplateId) ?: autoTarget
+    val matchScore: Float? = remember(livePose, targetTemplate) {
+        val p = livePose ?: return@remember null
+        val t = targetTemplate ?: return@remember null
+        PoseCoach.rankTemplates(p).firstOrNull { it.first.id == t.id }?.second
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -91,27 +142,113 @@ fun CameraScreen() {
                     val previewView = PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                     cameraProviderFuture.addListener({
-                        val provider = cameraProviderFuture.get()
-                        val preview = Preview.Builder().build().also {
-                            it.setSurfaceProvider(previewView.surfaceProvider)
-                        }
-                        val capture = ImageCapture.Builder()
-                            // 1.3.x 默认输出格式即 JPEG, 可直接解码为 Bitmap
-                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                            .build()
-                        imageCapture = capture
-                        val selector = CameraSelector.DEFAULT_BACK_CAMERA
                         try {
+                            val provider = cameraProviderFuture.get()
+                            val preview = Preview.Builder().build().also {
+                                it.setSurfaceProvider(previewView.surfaceProvider)
+                            }
+                            val capture = ImageCapture.Builder()
+                                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                                .build()
+                            val analysis = ImageAnalysis.Builder()
+                                .setResolutionSelector(
+                                    ResolutionSelector.Builder()
+                                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                                        .build()
+                                )
+                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                .build()
+                            var lastTs = 0L
+                            analysis.setAnalyzer(analysisExecutor) { proxy ->
+                                val media = proxy.image
+                                val now = System.currentTimeMillis()
+                                // 限流到 ~8fps, 够用又不烫手
+                                if (media == null || now - lastTs < 120) {
+                                    proxy.close()
+                                    return@setAnalyzer
+                                }
+                                lastTs = now
+                                val rot = proxy.imageInfo.rotationDegrees
+                                contentWidth = if (rot == 90 || rot == 270) proxy.height else proxy.width
+                                contentHeight = if (rot == 90 || rot == 270) proxy.width else proxy.height
+                                liveEstimator.detectAsync(
+                                    mediaImage = media,
+                                    rotationDegrees = rot,
+                                    onResult = { p ->
+                                        livePose = p
+                                        liveAdvice = p?.let { PoseCoach.buildAdvice(it) } ?: emptyList()
+                                    },
+                                    onComplete = { proxy.close() },
+                                )
+                            }
+                            imageCapture = capture
                             provider.unbindAll()
-                            provider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
-                        } catch (_: Exception) {}
+                            provider.bindToLifecycle(
+                                lifecycleOwner,
+                                CameraSelector.DEFAULT_BACK_CAMERA,
+                                preview,
+                                capture,
+                                analysis,
+                            )
+                        } catch (_: Exception) {
+                        }
                     }, ContextCompat.getMainExecutor(ctx))
                     previewView
                 },
                 modifier = Modifier.fillMaxSize(),
             )
-            // 三分线 + 中心标记叠加
-            RuleOfThirdsOverlay()
+
+            PoseOverlay(
+                pose = livePose,
+                target = targetTemplate,
+                contentWidth = contentWidth,
+                contentHeight = contentHeight,
+                fillCenter = true,
+                drawThirds = true,
+                modifier = Modifier.fillMaxSize(),
+            )
+
+            AdvicePanel(
+                advice = liveAdvice,
+                modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
+            )
+
+            val caption = buildString {
+                if (targetTemplate != null) {
+                    append("参考姿势：${targetTemplate.name}")
+                    if (matchScore != null) append("  匹配 ${(matchScore * 100).toInt()}%")
+                }
+            }
+            if (caption.isNotEmpty()) {
+                Text(
+                    text = caption,
+                    color = Color(0xFFFFC857),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(12.dp),
+                )
+            }
+        }
+
+        LazyRow(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            item {
+                FilterChip(
+                    selected = selectedTemplateId == null,
+                    onClick = { selectedTemplateId = null },
+                    label = { Text("自动") },
+                )
+            }
+            items(PoseTemplates.ALL, key = { it.id }) { t ->
+                FilterChip(
+                    selected = selectedTemplateId == t.id,
+                    onClick = { selectedTemplateId = t.id },
+                    label = { Text(t.name) },
+                )
+            }
         }
 
         Row(
@@ -147,10 +284,16 @@ fun CameraScreen() {
                                 // 相机原图通常 12MP 级别, 直接上屏/推理会 OOM, 先降采样
                                 val bmp = downscale(decoded)
                                 capturedBitmap = bmp
-                                result = null
+                                cropResult = null
+                                photoPose = null
+                                photoAdvice = emptyList()
                                 scope.launch {
                                     try {
-                                        result = AnalyzerHolder.analyze(context, bmp)
+                                        cropResult = AnalyzerHolder.analyze(context, bmp)
+                                        val p = photoEstimator.detect(bmp)
+                                        photoPose = p
+                                        photoAdvice = p?.let { PoseCoach.buildAdvice(it) }
+                                            ?: listOf(PoseAdvice(AdviceLevel.WARN, "没检测到人物，请让被拍者完整进入画面"))
                                     } catch (t: Throwable) {
                                         errorMsg = "分析失败: ${t.message ?: t.javaClass.simpleName}"
                                     } finally {
@@ -184,34 +327,45 @@ fun CameraScreen() {
         }
 
         capturedBitmap?.let { bmp ->
-            result?.bestCrop?.let { _ ->
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("建议裁剪 (评分 %.3f)".format(result!!.score),
-                        style = MaterialTheme.typography.bodyMedium)
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                cropResult?.let { c ->
+                    Text(
+                        "建议裁剪 评分 %.3f   耗时 %d ms".format(c.score, c.inferenceMs),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(bmp.width.toFloat() / bmp.height),
+                ) {
                     Image(
                         bitmap = bmp.asImageBitmap(),
                         contentDescription = null,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit,
                     )
+                    PoseOverlay(
+                        pose = photoPose,
+                        target = photoPose?.let { p ->
+                            PoseTemplates.byId(selectedTemplateId)
+                                ?: PoseCoach.rankTemplates(p).firstOrNull()?.first
+                        },
+                        contentWidth = bmp.width,
+                        contentHeight = bmp.height,
+                        fillCenter = false,
+                        drawThirds = false,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                if (photoAdvice.isNotEmpty()) {
+                    AdvicePanel(advice = photoAdvice, modifier = Modifier.fillMaxWidth())
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun RuleOfThirdsOverlay() {
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        val color = Color.White.copy(alpha = 0.4f)
-        // 两条竖线
-        drawLine(color, Offset(w / 3, 0f), Offset(w / 3, h), strokeWidth = 2f)
-        drawLine(color, Offset(2 * w / 3, 0f), Offset(2 * w / 3, h), strokeWidth = 2f)
-        // 两条横线
-        drawLine(color, Offset(0f, h / 3), Offset(w, h / 3), strokeWidth = 2f)
-        drawLine(color, Offset(0f, 2 * h / 3), Offset(w, 2 * h / 3), strokeWidth = 2f)
     }
 }
 
