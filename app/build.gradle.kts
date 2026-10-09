@@ -66,6 +66,11 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    androidResources {
+        // TFLite 模型不压缩, 便于 mmap 打开
+        noCompress += "tflite"
+    }
 }
 
 dependencies {
@@ -89,8 +94,11 @@ dependencies {
     // MediaPipe Pose Landmarker — 端侧人体骨骼关键点
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
-    // ML Kit 图像标签 — 端侧场景识别 (仅用于姿势软推荐, 离线)
+    // ML Kit 图像标签 — 场景识别兜底 (Places365 加载失败时使用, 离线)
     implementation("com.google.mlkit:image-labeling:17.0.8")
+
+    // TFLite — Places365 场景分类 (365 类, 本地推理)
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 
     // 协程
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

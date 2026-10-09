@@ -24,10 +24,10 @@ enum class CoarseScene(
             "sea", "ocean", "beach", "coast", "shore", "water", "sand",
             "wave", "lake", "horizon", "river", "waterfall", "island",
             "tree", "grass", "plant", "garden", "forest", "leaf", "meadow",
-            "field", "nature", "wood", "flower", "bush", "leaf",
+            "field", "nature", "wood", "flower", "bush",
             "mountain", "snow", "ice", "peak", "rock", "cliff", "hill",
             "valley", "canyon", "desert", "landscape", "outdoor", "country",
-            "sunlight", "rainbow", "fog", "meadow", "pasture",
+            "sunlight", "rainbow", "fog", "pasture",
         ),
     ),
     STREET(
@@ -54,7 +54,7 @@ enum class CoarseScene(
     ;
 
     companion object {
-        /** 从 ML Kit 标签粗打分: 词级匹配 + 细分类归属加分, 取最高且过阈值者 */
+        /** 从 ML Kit 标签粗打分 (Places365 不可用时的兜底): 词级匹配 + 细分类归属加分 */
         fun from(labels: List<Pair<String, Float>>, fine: SceneTag?): CoarseScene? {
             val scores = HashMap<CoarseScene, Float>()
             for ((text, conf) in labels) {
@@ -65,7 +65,6 @@ enum class CoarseScene(
                     }
                 }
             }
-            // 细分类已归属的大类额外加分, 让细分类结果能带出粗分类
             val fineOwner = when (fine) {
                 SceneTag.BEACH, SceneTag.PARK, SceneTag.SNOW -> OPEN
                 SceneTag.STREET, SceneTag.NIGHT -> STREET
@@ -109,27 +108,73 @@ enum class SceneTag(val displayName: String, val emoji: String, val keywords: Se
     }
 }
 
-/** 场景识别结果: 粗大类 (硬过滤) + 细分类 (微调, 可空) */
-data class SceneVerdict(val coarse: CoarseScene?, val fine: SceneTag?)
+/**
+ * 场景识别结果。
+ *
+ * 主路径是 Places365 (365 类场景模型): [label] 为 top-1 标签, [labelZh] 是中文名,
+ * 粗/细分类都由它推导。Places365 加载失败时回落 ML Kit 标签, 此时只有 coarse/fine。
+ */
+data class SceneVerdict(
+    val coarse: CoarseScene?,
+    val fine: SceneTag?,
+    val label: String? = null,
+    val labelZh: String? = null,
+    val usability: SceneUsability = SceneUsability.OK,
+)
 
 /**
- * 场景识别 (ML Kit 端侧, 离线) + 多帧投票去抖。
+ * 场景识别 (Places365 端侧 TFLite, 离线) + 多帧投票去抖。
  *
- * 调用方按 ~1.5s 间隔喂数据, 粗/细各自做 5 票投票, ≥2 票一致才输出,
- * 避免识别结果闪烁。粗分类只影响推荐池, 识别不准也不阻断拍照。
+ * 调用方按 ~1.5s 间隔喂数据, 标签做 5 票投票, ≥2 票一致才输出, 避免闪烁。
+ * 另外用画面平均亮度判断夜景 (Places365 没有"夜晚"这一类)。
  */
 class SceneDetector(context: Context) {
 
-    private val labeler = ImageLabeling.getClient(
-        ImageLabelerOptions.Builder().setConfidenceThreshold(0.35f).build()
-    )
+    private val appContext = context.applicationContext
 
+    /** 主路径: Places365; 模型缺失/内存不足时为 null, 回落 ML Kit */
+    private val places = PlacesSceneClassifier.create(appContext)
+
+    private val labeler = if (places == null) {
+        ImageLabeling.getClient(
+            ImageLabelerOptions.Builder().setConfidenceThreshold(0.35f).build(),
+        )
+    } else null
+
+    private val labelVotes = ArrayDeque<String>()
+    private val darkVotes = ArrayDeque<Boolean>()
     private val coarseVotes = ArrayDeque<CoarseScene?>()
     private val fineVotes = ArrayDeque<SceneTag?>()
     private var busy = false
 
+    init {
+        SceneAffinity.load(appContext)
+    }
+
     fun classifyAsync(bitmap: Bitmap, onResult: (SceneVerdict) -> Unit) {
         if (busy) return
+        val model = places
+        if (model == null) {
+            classifyWithMlKit(bitmap, onResult)
+            return
+        }
+        // Places365 是同步推理 (~几十 ms), 调用方已在后台分析线程上, 直接算完回调
+        busy = true
+        try {
+            val top = model.classify(bitmap, 3)
+            pushPlaces(top, isDark(bitmap))
+        } catch (_: Throwable) {
+            // 单次推理失败按"没识别"计入投票, 不打断流程
+        }
+        busy = false
+        onResult(stable())
+    }
+
+    private fun classifyWithMlKit(bitmap: Bitmap, onResult: (SceneVerdict) -> Unit) {
+        val labeler = labeler ?: run {
+            onResult(stable())
+            return
+        }
         busy = true
         labeler.process(InputImage.fromBitmap(bitmap, 0))
             .addOnSuccessListener { labels ->
@@ -143,6 +188,16 @@ class SceneDetector(context: Context) {
             }
     }
 
+    private fun pushPlaces(top: List<ScenePrediction>, dark: Boolean) {
+        val label = top.firstOrNull()?.label
+        if (label != null) {
+            labelVotes.addLast(label.lowercase())
+            if (labelVotes.size >= VOTE_WINDOW) labelVotes.removeFirst()
+        }
+        darkVotes.addLast(dark)
+        if (darkVotes.size >= VOTE_WINDOW) darkVotes.removeFirst()
+    }
+
     private fun push(fine: SceneTag?, pairs: List<Pair<String, Float>>) {
         val coarse = CoarseScene.from(pairs, fine)
         if (coarseVotes.size >= VOTE_WINDOW) coarseVotes.removeFirst()
@@ -151,22 +206,58 @@ class SceneDetector(context: Context) {
         fineVotes.addLast(fine)
     }
 
-    private fun stable(): SceneVerdict = SceneVerdict(
-        coarse = voteMajority(coarseVotes),
-        fine = voteMajority(fineVotes),
-    )
+    private fun stable(): SceneVerdict {
+        val label = voteMajority(labelVotes)
+        if (label != null) {
+            var group = SceneAffinity.groupOf(label)
+            // 室外 + 画面偏暗 → 按夜景处理 (夜景推荐比"这是什么景"更重要)
+            val dark = voteMajority(darkVotes) == true
+            if (dark && group != SceneGroup.CAFE && group != SceneGroup.GENERAL) {
+                group = SceneGroup.NIGHT
+            }
+            return SceneVerdict(
+                coarse = group.coarse,
+                fine = group.tag,
+                label = label,
+                labelZh = SceneLabels.zh(label),
+                usability = SceneAffinity.usabilityOf(label),
+            )
+        }
+        return SceneVerdict(
+            coarse = voteMajority(coarseVotes),
+            fine = voteMajority(fineVotes),
+        )
+    }
 
-    private fun <T> voteMajority(votes: ArrayDeque<T?>): T? {
-        val counts = votes.filterNotNull().groupingBy { it }.eachCount()
+    private fun <T> voteMajority(votes: ArrayDeque<T>): T? {
+        val counts = votes.groupingBy { it }.eachCount()
         val best = counts.maxByOrNull { it.value } ?: return null
         return best.takeIf { it.value >= 2 }?.key
     }
 
+    /** 画面平均亮度 0..1 (缩到 8×8 采样, 开销可忽略) */
+    private fun isDark(bitmap: Bitmap): Boolean {
+        val small = Bitmap.createScaledBitmap(bitmap, 8, 8, true)
+        val px = IntArray(64)
+        small.getPixels(px, 0, 8, 0, 0, 8, 8)
+        if (small !== bitmap) small.recycle()
+        var sum = 0.0
+        for (p in px) {
+            val r = (p shr 16 and 0xFF)
+            val g = (p shr 8 and 0xFF)
+            val b = (p and 0xFF)
+            sum += 0.299 * r + 0.587 * g + 0.114 * b
+        }
+        return sum / px.size / 255.0 < DARK_THRESHOLD
+    }
+
     fun close() {
-        labeler.close()
+        places?.close()
+        labeler?.close()
     }
 
     private companion object {
         const val VOTE_WINDOW = 5
+        const val DARK_THRESHOLD = 0.22
     }
 }

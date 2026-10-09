@@ -4,7 +4,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
@@ -13,6 +15,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import com.aicompose.core.guide.AlignmentState
 import com.aicompose.core.guide.CompositionEngine
 import com.aicompose.core.guide.Joint
+import com.aicompose.core.guide.PoseSpec
 import com.aicompose.core.guide.PoseTemplate
 import com.aicompose.core.guide.Tilt
 import kotlin.math.cos
@@ -179,6 +182,72 @@ fun PoseSkeletonOverlay(
                 headRadius = 9f,
             )
         }
+    }
+}
+
+/**
+ * 站位框 (移植自 aicamera): 按 PoseSpec 的目标重心/脚线/人物占比画出「人该站哪儿」。
+ * 虚线框 + 顶部目标点; 人走进框里时随 [state] 一起变绿。
+ */
+@Composable
+fun PositionBoxOverlay(
+    spec: PoseSpec?,
+    frameWidth: Float,
+    frameHeight: Float,
+    mirrored: Boolean,
+    state: AlignmentState,
+    modifier: Modifier = Modifier,
+) {
+    if (spec == null) return
+    val color = GuideColors.of(state)
+    Canvas(modifier = modifier) {
+        // 分析帧 → 屏幕 (FILL_CENTER), 与 PoseSkeletonOverlay 同一套变换
+        val fw = frameWidth
+        val fh = frameHeight
+        val tx: ((Float, Float) -> Offset)? = if (fw > 0f && fh > 0f) {
+            val scale = maxOf(size.width / fw, size.height / fh)
+            val dx = (size.width - fw * scale) / 2f
+            val dy = (size.height - fh * scale) / 2f
+            { x: Float, y: Float -> Offset(dx + x * fw * scale, dy + y * fh * scale) }
+        } else null
+
+        val cx = if (mirrored) 1f - spec.targetCx else spec.targetCx
+        val left: Float
+        val top: Float
+        val boxW: Float
+        val boxH: Float
+        if (tx != null) {
+            // 脚线 → 头顶 的屏幕距离即目标人物高度 (占比与帧同口径)
+            val foot = tx(0f, spec.targetFootY)
+            val head = tx(0f, (spec.targetFootY - spec.bboxHRatio).coerceAtLeast(0f))
+            boxH = kotlin.math.abs(foot.y - head.y).coerceAtLeast(40f)
+            boxW = boxH * spec.boxAspect
+            val c = tx(cx, 0f)
+            left = c.x - boxW / 2f
+            top = foot.y - boxH
+        } else {
+            boxH = (spec.bboxHRatio * size.height).coerceAtLeast(40f)
+            boxW = boxH * spec.boxAspect
+            left = cx * size.width - boxW / 2f
+            top = spec.targetFootY * size.height - boxH
+        }
+
+        drawRoundRect(
+            color = color.copy(alpha = 0.75f),
+            topLeft = Offset(left, top),
+            size = Size(boxW, boxH),
+            cornerRadius = CornerRadius(18f, 18f),
+            style = Stroke(
+                width = 3f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(18f, 12f)),
+            ),
+        )
+        // 顶部目标点: 人物重心该落的位置
+        drawCircle(
+            color = color.copy(alpha = 0.9f),
+            radius = 7f,
+            center = Offset(left + boxW / 2f, top),
+        )
     }
 }
 

@@ -67,11 +67,18 @@ import com.aicompose.core.guide.AlignmentState
 import com.aicompose.core.guide.CoarseScene
 import com.aicompose.core.guide.CompositionEngine
 import com.aicompose.core.guide.DetectedJoint
+import com.aicompose.core.guide.Guidance
+import com.aicompose.core.guide.GuidanceArbiter
 import com.aicompose.core.guide.PoseLandmarkerManager
+import com.aicompose.core.guide.PoseSpec
+import com.aicompose.core.guide.PoseSpecMatcher
+import com.aicompose.core.guide.PoseSpecs
 import com.aicompose.core.guide.PoseTemplate
 import com.aicompose.core.guide.PoseTemplateCatalog
+import com.aicompose.core.guide.SceneAffinity
 import com.aicompose.core.guide.SceneDetector
 import com.aicompose.core.guide.SceneVerdict
+import com.aicompose.core.guide.Severity
 import com.aicompose.core.guide.Tilt
 import com.aicompose.core.guide.TiltSensor
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -81,6 +88,29 @@ import kotlinx.coroutines.delay
 
 /** 骨骼检测限流 ~15fps */
 private const val FRAME_INTERVAL_MS = 66L
+
+/**
+ * 推荐池: 优先用 Places365 标签查 scene_affinity 亲和表 (返回顺序 = 推荐优先级),
+ * 标签不在表里时用兜底 id 列表, 再不行才退回粗/细分类的标签匹配。
+ */
+private fun affinityPool(
+    verdict: SceneVerdict,
+    templates: List<PoseTemplate>,
+): List<PoseTemplate> {
+    val byId = templates.associateBy { it.id }
+    val ids = verdict.label?.let { SceneAffinity.templatesFor(it) }
+        ?: SceneAffinity.fallbackIds()
+    val fromTable = ids.mapNotNull { byId[it] }
+    if (fromTable.isNotEmpty()) return fromTable
+
+    val fine = verdict.fine
+    val group = verdict.coarse?.poseTags
+    return when {
+        fine != null -> templates.filter { fine.displayName in it.tags }
+        group != null -> templates.filter { t -> t.tags.any { it in group } }
+        else -> emptyList()
+    }
+}
 
 /** 场景识别限流 ~1.5s */
 private const val SCENE_INTERVAL_MS = 1500L
@@ -167,6 +197,7 @@ fun SnapGuideScreen() {
 
     // ---------- 姿态相似度 (EMA 平滑防抖) ----------
     val aspect = if (frame.height > 0) frame.width.toFloat() / frame.height else 0.75f
+    val spec: PoseSpec? = selected?.let { PoseSpecs.derive(it) }
     val sim = if (pose != null && selected != null) {
         CompositionEngine.similarity(pose!!, selected!!, aspect)
     } else {
@@ -180,10 +211,19 @@ fun SnapGuideScreen() {
             else -> scoreEma + (s - scoreEma) * 0.35f
         }
     }
+    // 关节角比对 (PoseSpec) 与骨架余弦比对取更靠得住的那个: 站位框变绿靠它
+    val specScore = if (pose != null && spec != null) {
+        PoseSpecMatcher.score(pose!!, spec)
+    } else {
+        -1f
+    }
+    val bestScore = listOf(scoreEma, specScore)
+        .filter { !it.isNaN() && it >= 0f }
+        .maxOrNull()
     val state = when {
-        sim == null || scoreEma.isNaN() || scoreEma < 0f -> AlignmentState.IDLE
-        scoreEma >= 0.80f -> AlignmentState.MATCHED
-        scoreEma >= 0.60f -> AlignmentState.NEAR
+        bestScore == null -> AlignmentState.IDLE
+        bestScore >= 0.80f -> AlignmentState.MATCHED
+        bestScore >= 0.60f -> AlignmentState.NEAR
         else -> AlignmentState.IDLE
     }
 
@@ -200,22 +240,15 @@ fun SnapGuideScreen() {
 
     // ---------- 景别 (自动推荐与引导文案共用) ----------
     val shot = pose?.let { CompositionEngine.detectShotType(it) }
-    val personRatio = pose?.let { CompositionEngine.personHeight(it) }
 
     // ---------- 场景 → 自动推荐姿势 ----------
-    // 硬过滤: 粗大类 (开阔自然/街景建筑/室内) 决定推荐池, 开阔场景禁用道具姿势;
-    // 细分类做同大类内微调; 有人时推荐与当前姿态最接近的。
+    // 首选: Places365 标签 → scene_affinity 亲和表 (推荐顺序就是表里的顺序);
+    // 表查不到时退回「粗大类/细分类标签匹配」; 开阔场景仍硬过滤道具姿势。
     // 手动选过的 (manualPick) 不被覆盖, 取消选择后恢复自动。
     val hasPerson = pose != null
     LaunchedEffect(verdict, hasPerson) {
         if (manualPick) return@LaunchedEffect
-        val fine = verdict.fine
-        val group = verdict.coarse?.poseTags
-        var candidates = when {
-            fine != null -> templates.filter { fine.displayName in it.tags }
-            group != null -> templates.filter { t -> t.tags.any { it in group } }
-            else -> emptyList()
-        }
+        var candidates = affinityPool(verdict, templates)
         if (verdict.coarse == CoarseScene.OPEN) {
             candidates = candidates.filter { it.id !in PROP_POSES }
         }
@@ -234,23 +267,26 @@ fun SnapGuideScreen() {
         if (selected?.id != best.id) {
             selected = best
             scoreEma = Float.NaN
-            val label = verdict.coarse?.let { "${it.emoji} ${it.displayName}" }
-                ?: fine?.let { "${it.emoji} ${it.displayName}" }
+            val label = verdict.labelZh
+                ?: verdict.coarse?.let { "${it.emoji} ${it.displayName}" }
+                ?: verdict.fine?.let { "${it.emoji} ${it.displayName}" }
             if (label != null) {
-                toast = "识别到${label}场景，已自动推荐「${best.name}」"
+                toast = "识别到${label}，已自动推荐「${best.name}」"
             }
         }
     }
 
-    // ---------- 引导文案 ----------
+    // ---------- 引导文案: 一次一条, 由仲裁器按优先级收敛 ----------
     val smoothedSim = sim?.copy(score = if (scoreEma.isNaN()) sim.score else scoreEma)
-    val guidance = CompositionEngine.guidance(
-        personVisible = pose != null,
-        shotType = shot,
-        personRatio = personRatio,
+    val guidance: Guidance = GuidanceArbiter.decide(
+        person = pose,
         template = selected,
+        spec = spec,
         sim = smoothedSim,
+        rollDeg = tilt.rollDeg,
         pitchDeg = tilt.pitchDeg,
+        usability = verdict.usability,
+        sceneZh = verdict.labelZh ?: verdict.coarse?.displayName,
     )
 
     // ---------- 物理倾角传感器 ----------
@@ -418,8 +454,16 @@ fun SnapGuideScreen() {
     ) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
-        // 三分线 + 水平仪 + 骨架叠加
+        // 三分线 + 水平仪 + 站位框 + 骨架叠加
         GridThirds(Modifier.fillMaxSize())
+        PositionBoxOverlay(
+            spec = spec,
+            frameWidth = frame.width.toFloat(),
+            frameHeight = frame.height.toFloat(),
+            mirrored = mirrored,
+            state = state,
+            modifier = Modifier.fillMaxSize(),
+        )
         PoseSkeletonOverlay(
             userJoints = pose,
             frameWidth = frame.width.toFloat(),
@@ -451,23 +495,30 @@ fun SnapGuideScreen() {
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                     )
                 }
-                verdict.coarse?.let { c ->
-                    Surface(
-                        color = Color.Black.copy(alpha = 0.45f),
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        val fine = verdict.fine
-                        val text = if (fine != null && fine.displayName != c.displayName) {
-                            "${c.emoji} ${c.displayName} · ${fine.displayName}"
-                        } else {
-                            "${c.emoji} ${c.displayName}"
+                verdict.let {
+                    val zh = it.labelZh
+                    val coarse = it.coarse
+                    val fine = it.fine
+                    val text = when {
+                        zh != null && coarse != null -> "${coarse.emoji} ${coarse.displayName} · $zh"
+                        zh != null -> zh
+                        coarse != null && fine != null && fine.displayName != coarse.displayName ->
+                            "${coarse.emoji} ${coarse.displayName} · ${fine.displayName}"
+                        coarse != null -> "${coarse.emoji} ${coarse.displayName}"
+                        else -> null
+                    }
+                    if (text != null) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.45f),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = text,
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            )
                         }
-                        Text(
-                            text = text,
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                        )
                     }
                 }
             }
@@ -521,34 +572,46 @@ fun SnapGuideScreen() {
                 .fillMaxWidth()
                 .padding(bottom = 24.dp),
         ) {
-            if (guidance.isNotBlank()) {
-                Surface(
-                    color = when (state) {
+            // 一次一条指令: 严重程度决定配色, detail 给出可核对的数值
+            Surface(
+                color = when (guidance.severity) {
+                    Severity.OK -> GuideColors.MATCHED.copy(alpha = 0.92f)
+                    Severity.WARN -> GuideColors.NEAR.copy(alpha = 0.90f)
+                    Severity.BLOCKER -> Color(0xFFC62828).copy(alpha = 0.92f)
+                    Severity.HINT -> when (state) {
                         AlignmentState.MATCHED -> GuideColors.MATCHED.copy(alpha = 0.92f)
                         AlignmentState.NEAR -> GuideColors.NEAR.copy(alpha = 0.88f)
                         AlignmentState.IDLE -> Color.Black.copy(alpha = 0.55f)
-                    },
-                    shape = RoundedCornerShape(20.dp),
+                    }
+                },
+                shape = RoundedCornerShape(20.dp),
+            ) {
+                val onDark = guidance.severity == Severity.BLOCKER ||
+                    (guidance.severity == Severity.HINT && state == AlignmentState.IDLE)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 ) {
                     Text(
-                        text = guidance,
-                        color = if (state == AlignmentState.IDLE) Color.White else Color.Black,
+                        text = guidance.text,
+                        color = if (onDark) Color.White else Color.Black,
                         style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     )
+                    if (!guidance.detail.isNullOrBlank()) {
+                        Text(
+                            text = guidance.detail.orEmpty(),
+                            color = if (onDark) Color.White.copy(alpha = 0.82f)
+                            else Color.Black.copy(alpha = 0.72f),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
                 }
             }
 
-            // 模板栏: 场景相关池硬过滤 (粗大类 → 细分类) > 景别匹配排序;
+            // 模板栏: 亲和表顺序 = 推荐优先级, 景别匹配只做稳定排序内的加权;
             // 开阔自然禁用道具姿势; 场景未知时显示全部
             val ordered = remember(verdict, shot, selected) {
-                val fine = verdict.fine
-                val group = verdict.coarse?.poseTags
-                var base = when {
-                    fine != null -> templates.filter { fine.displayName in it.tags }
-                    group != null -> templates.filter { t -> t.tags.any { it in group } }
-                    else -> templates
-                }
+                var base = affinityPool(verdict, templates)
                 if (verdict.coarse == CoarseScene.OPEN) {
                     base = base.filter { it.id !in PROP_POSES }
                 }
@@ -559,7 +622,7 @@ fun SnapGuideScreen() {
                 }
                 fun rank(t: PoseTemplate): Int {
                     var r = 0
-                    if (verdict.coarse != null && t.tags.any { it in verdict.coarse!!.poseTags }) r += 2
+                    if (verdict.label != null && SceneAffinity.templatesFor(verdict.label!!)?.first() == t.id) r += 3
                     if (shot != null && t.shotType == shot) r += 1
                     return r
                 }

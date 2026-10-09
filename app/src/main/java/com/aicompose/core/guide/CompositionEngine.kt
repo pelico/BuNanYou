@@ -69,6 +69,30 @@ object CompositionEngine {
         }
     }
 
+    /** 判断「人有没有被挡住 / 被切掉」时看的核心点 */
+    private val CORE_JOINTS = intArrayOf(0, 11, 12, 23, 24, 25, 26, 27, 28)
+
+    /** 站位/遮挡所需的可测属性; 没有一个核心点可见时返回 null */
+    fun metrics(joints: Map<Int, DetectedJoint>): PersonMetrics? {
+        val visible = CORE_JOINTS.toList().mapNotNull { id ->
+            joints[id]?.takeIf { it.visibility >= VIS_MIN }
+        }
+        if (visible.isEmpty()) return null
+        val minX = visible.minOf { it.x }
+        val maxX = visible.maxOf { it.x }
+        val maxY = visible.maxOf { it.y }
+        val cropped = visible.any {
+            it.x <= 0.02f || it.x >= 0.98f || it.y <= 0.02f || it.y >= 0.98f
+        }
+        return PersonMetrics(
+            visibleRatio = visible.size / CORE_JOINTS.size.toFloat(),
+            cropped = cropped,
+            centerX = (minX + maxX) / 2f,
+            footY = maxY,
+            heightRatio = personHeight(joints),
+        )
+    }
+
     // ---------------- 姿态相似度 ----------------
 
     data class Similarity(
@@ -173,40 +197,5 @@ object CompositionEngine {
     private fun midpoint(a: Joint?, b: Joint?): Pair<Float, Float>? {
         if (a == null || b == null) return null
         return ((a.x + b.x) / 2f) to ((a.y + b.y) / 2f)
-    }
-
-    // ---------------- 引导文案 ----------------
-
-    /**
-     * 状态机文案:
-     * 状态0 无人 → 状态1 有人无模板 (景别引导) → 状态2 对齐中 (动态提示) → 状态3 已对齐
-     */
-    fun guidance(
-        personVisible: Boolean,
-        shotType: ShotType?,
-        personRatio: Float?,
-        template: PoseTemplate?,
-        sim: Similarity?,
-        pitchDeg: Float,
-    ): String {
-        if (!personVisible) return "对准人物，激活人像构图指导"
-        if (template == null) return when (shotType) {
-            ShotType.FULL_BODY -> "全身像：双脚贴近画面底边，机位下沉到腰部"
-            ShotType.HALF_BODY -> "半身像：眼睛对齐画面上 1/3 线"
-            ShotType.CLOSE_UP -> "特写：把人物放在左右三分交点上"
-            null -> ""
-        }
-        // 模板对齐中: 尺寸 → 俯仰 → 姿态
-        val ratio = personRatio
-        if (ratio != null && ratio < template.targetPersonRatio * 0.8f) return "向前走两步，人物再大一点"
-        if (ratio != null && ratio > template.targetPersonRatio * 1.25f) return "向后退一点，人物快装不下了"
-        if (template.shotType == ShotType.FULL_BODY && pitchDeg > 5f) return "把手机放平，避免把人拍矮"
-        val s = sim?.score ?: -1f
-        if (s < 0) return template.guideText
-        return when {
-            s >= 0.80f -> "姿态已对齐，可拍摄 ✓"
-            s >= 0.60f -> "接近了！注意调整${sim?.worstBone ?: "姿势"}"
-            else -> "跟随虚线骨架，调整${sim?.worstBone ?: "姿势"}"
-        }
     }
 }
