@@ -204,7 +204,7 @@ object CompositionEngine {
         val s = sim?.score ?: -1f
         if (s < 0) return template.guideText
         return when {
-            s >= 0.82f -> "姿态已对齐，可拍摄 ✓"
+            s >= 0.80f -> "姿态已对齐，可拍摄 ✓"
             s >= 0.60f -> "接近了！注意调整${sim?.worstBone ?: "姿势"}"
             else -> "跟随虚线骨架，调整${sim?.worstBone ?: "姿势"}"
         }

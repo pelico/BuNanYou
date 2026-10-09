@@ -11,8 +11,8 @@ android {
         applicationId = "com.aicompose"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.5.1"
+        versionCode = 8
+        versionName = "0.5.2"
         ndk {
             // 只打包 arm64-v8a, 大幅缩减 APK 体积 (现代安卓手机主流架构)
             abiFilters += listOf("arm64-v8a")

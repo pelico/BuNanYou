@@ -64,13 +64,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.aicompose.core.guide.AlignmentState
+import com.aicompose.core.guide.CoarseScene
 import com.aicompose.core.guide.CompositionEngine
 import com.aicompose.core.guide.DetectedJoint
 import com.aicompose.core.guide.PoseLandmarkerManager
 import com.aicompose.core.guide.PoseTemplate
 import com.aicompose.core.guide.PoseTemplateCatalog
 import com.aicompose.core.guide.SceneDetector
-import com.aicompose.core.guide.SceneTag
+import com.aicompose.core.guide.SceneVerdict
 import com.aicompose.core.guide.Tilt
 import com.aicompose.core.guide.TiltSensor
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -83,6 +84,18 @@ private const val FRAME_INTERVAL_MS = 66L
 
 /** 场景识别限流 ~1.5s */
 private const val SCENE_INTERVAL_MS = 1500L
+
+/** 连续多少帧空结果才判定"无人" (防抖, 避免单帧丢失闪回提示) */
+private const val EMPTY_STREAK_CLEAR = 3
+
+/**
+ * 需要道具/支撑物的姿势 —— 开阔自然场景 (山顶/海边/草地) 禁止推荐。
+ * 倚树也算支撑物: 山顶没有树。
+ */
+private val PROP_POSES = setOf(
+    "street_wall", "street_lean", "street_step", "park_lean",
+    "night_lean", "night_sit",
+)
 
 /**
  * SnapGuide 主取景页:
@@ -119,7 +132,7 @@ fun SnapGuideScreen() {
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var toast by remember { mutableStateOf<String?>(null) }
     var lastHapticAt by remember { mutableLongStateOf(0L) }
-    var scene by remember { mutableStateOf<SceneTag?>(null) }
+    var verdict by remember { mutableStateOf(SceneVerdict(null, null)) }
     var manualPick by remember { mutableStateOf(false) }
 
     val templates = remember { PoseTemplateCatalog.load(context) }
@@ -127,14 +140,19 @@ fun SnapGuideScreen() {
     val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
     val analyzerExecutor = remember { Executors.newSingleThreadExecutor() }
     val landmarker = remember {
+        // 空结果防抖: 连续 3 帧 (≈0.2s) 无人才清掉 pose, 单帧丢失不闪回提示
+        var emptyStreak = 0
         PoseLandmarkerManager(context) { result ->
             val lm = result?.landmarks()?.firstOrNull()
-            pose = if (lm.isNullOrEmpty()) {
-                null
+            if (lm.isNullOrEmpty()) {
+                if (++emptyStreak >= EMPTY_STREAK_CLEAR) pose = null
             } else {
-                lm.mapIndexed { i, l ->
+                emptyStreak = 0
+                val map = lm.mapIndexed { i, l ->
                     i to DetectedJoint(l.x(), l.y(), l.visibility().orElse(0f))
                 }.toMap()
+                // 关节置信度 > 0.5 才认定检测到人体, 切换出"对准人物"提示
+                if (map.values.any { it.visibility >= 0.5f }) pose = map
             }
         }
     }
@@ -164,7 +182,7 @@ fun SnapGuideScreen() {
     }
     val state = when {
         sim == null || scoreEma.isNaN() || scoreEma < 0f -> AlignmentState.IDLE
-        scoreEma >= 0.82f -> AlignmentState.MATCHED
+        scoreEma >= 0.80f -> AlignmentState.MATCHED
         scoreEma >= 0.60f -> AlignmentState.NEAR
         else -> AlignmentState.IDLE
     }
@@ -185,18 +203,28 @@ fun SnapGuideScreen() {
     val personRatio = pose?.let { CompositionEngine.personHeight(it) }
 
     // ---------- 场景 → 自动推荐姿势 ----------
-    // 软推荐: 场景识别只改变"推荐哪些姿势", 不拦截拍照;
-    // 用户手动选过的姿势 (manualPick) 不会被自动覆盖, 点掉选中后恢复自动。
-    LaunchedEffect(scene) {
-        if (scene == null || manualPick) return@LaunchedEffect
-        val candidates = templates.filter { scene!!.displayName in it.tags }
+    // 硬过滤: 粗大类 (开阔自然/街景建筑/室内) 决定推荐池, 开阔场景禁用道具姿势;
+    // 细分类做同大类内微调; 有人时推荐与当前姿态最接近的。
+    // 手动选过的 (manualPick) 不被覆盖, 取消选择后恢复自动。
+    val hasPerson = pose != null
+    LaunchedEffect(verdict, hasPerson) {
+        if (manualPick) return@LaunchedEffect
+        val fine = verdict.fine
+        val group = verdict.coarse?.poseTags
+        var candidates = when {
+            fine != null -> templates.filter { fine.displayName in it.tags }
+            group != null -> templates.filter { t -> t.tags.any { it in group } }
+            else -> emptyList()
+        }
+        if (verdict.coarse == CoarseScene.OPEN) {
+            candidates = candidates.filter { it.id !in PROP_POSES }
+        }
         if (candidates.isEmpty()) return@LaunchedEffect
         val pool = if (shot != null && candidates.any { it.shotType == shot }) {
             candidates.filter { it.shotType == shot }
         } else {
             candidates
         }
-        // 有人时优先推荐与当前姿态最接近的, 没人时取场景第一位
         val best = if (pose != null) {
             pool.maxByOrNull { CompositionEngine.similarity(pose!!, it, aspect).score }
                 ?: pool.first()
@@ -206,7 +234,11 @@ fun SnapGuideScreen() {
         if (selected?.id != best.id) {
             selected = best
             scoreEma = Float.NaN
-            toast = "${scene!!.emoji} 识别到${scene!!.displayName}场景，已自动推荐「${best.name}」"
+            val label = verdict.coarse?.let { "${it.emoji} ${it.displayName}" }
+                ?: fine?.let { "${it.emoji} ${it.displayName}" }
+            if (label != null) {
+                toast = "识别到${label}场景，已自动推荐「${best.name}」"
+            }
         }
     }
 
@@ -254,12 +286,11 @@ fun SnapGuideScreen() {
                     .build()
 
                 var reuseRaw: Bitmap? = null
-                var reuseRot: Bitmap? = null
                 var lastTs = 0L
                 var lastSceneTs = 0L
                 analysis.setAnalyzer(analyzerExecutor) { proxy ->
                     try {
-                        val now = System.currentTimeMillis()
+                        val now = android.os.SystemClock.elapsedRealtime()
                         if (now - lastTs < FRAME_INTERVAL_MS) return@setAnalyzer
                         lastTs = now
                         val image = proxy.image ?: return@setAnalyzer
@@ -289,31 +320,33 @@ fun SnapGuideScreen() {
                             raw.copyPixelsFromBuffer(out)
                         }
 
+                        // 旋转校正 (竖屏时 rotationDegrees=90) → 每帧独立输出位图:
+                        // MediaPipe 是异步读取的, 复用位图会撕裂导致检测率归零
                         val rotation = proxy.imageInfo.rotationDegrees
                         val rw = if (rotation == 90 || rotation == 270) h else w
                         val rh = if (rotation == 90 || rotation == 270) w else h
-                        val rotated = if (rotation == 0) raw else {
-                            val m = Matrix().apply { postRotate(rotation.toFloat()) }
-                            val dst = reuseRot?.takeIf { it.width == rw && it.height == rh }
-                                ?: Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888)
-                                    .also { reuseRot = it }
-                            dst.eraseColor(android.graphics.Color.TRANSPARENT)
-                            Canvas(dst).drawBitmap(raw, m, null)
-                            dst
+                        val poseFrame = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888).also { dst ->
+                            val canvas = Canvas(dst)
+                            if (rotation == 0) {
+                                canvas.drawBitmap(raw, 0f, 0f, null)
+                            } else {
+                                val m = Matrix().apply { postRotate(rotation.toFloat()) }
+                                canvas.drawBitmap(raw, m, null)
+                            }
                         }
 
-                        if (frame.width != rotated.width || frame.height != rotated.height) {
-                            frame = IntSize(rotated.width, rotated.height)
+                        if (frame.width != poseFrame.width || frame.height != poseFrame.height) {
+                            frame = IntSize(poseFrame.width, poseFrame.height)
                         }
 
-                        // 场景识别 (独立限流): 拷贝一份给 ML Kit, 避免与复用位图冲突
+                        // 场景识别 (独立限流): 自带副本, 不与 MediaPipe 共享位图
                         if (now - lastSceneTs > SCENE_INTERVAL_MS) {
                             lastSceneTs = now
-                            val sceneCopy = Bitmap.createBitmap(rotated)
-                            sceneDetector.classifyAsync(sceneCopy) { s -> scene = s }
+                            val sceneCopy = Bitmap.createBitmap(poseFrame)
+                            sceneDetector.classifyAsync(sceneCopy) { v -> verdict = v }
                         }
 
-                        landmarker.detectAsync(BitmapImageBuilder(rotated).build(), now)
+                        landmarker.detectAsync(BitmapImageBuilder(poseFrame).build(), now)
                     } catch (_: Throwable) {
                         // 单帧失败直接丢弃, 不影响预览
                     } finally {
@@ -418,13 +451,19 @@ fun SnapGuideScreen() {
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                     )
                 }
-                scene?.let { s ->
+                verdict.coarse?.let { c ->
                     Surface(
                         color = Color.Black.copy(alpha = 0.45f),
                         shape = RoundedCornerShape(8.dp),
                     ) {
+                        val fine = verdict.fine
+                        val text = if (fine != null && fine.displayName != c.displayName) {
+                            "${c.emoji} ${c.displayName} · ${fine.displayName}"
+                        } else {
+                            "${c.emoji} ${c.displayName}"
+                        }
                         Text(
-                            text = "${s.emoji} ${s.displayName}",
+                            text = text,
                             color = Color.White,
                             style = MaterialTheme.typography.labelMedium,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -500,15 +539,31 @@ fun SnapGuideScreen() {
                 }
             }
 
-            // 模板栏: 场景匹配 > 景别匹配 排前面
-            val ordered = remember(scene, shot) {
+            // 模板栏: 场景相关池硬过滤 (粗大类 → 细分类) > 景别匹配排序;
+            // 开阔自然禁用道具姿势; 场景未知时显示全部
+            val ordered = remember(verdict, shot, selected) {
+                val fine = verdict.fine
+                val group = verdict.coarse?.poseTags
+                var base = when {
+                    fine != null -> templates.filter { fine.displayName in it.tags }
+                    group != null -> templates.filter { t -> t.tags.any { it in group } }
+                    else -> templates
+                }
+                if (verdict.coarse == CoarseScene.OPEN) {
+                    base = base.filter { it.id !in PROP_POSES }
+                }
+                if (base.isEmpty()) base = templates
+                // 当前选中若在池外, 仍保留一张卡防止选中项不可见
+                if (selected != null && base.none { it.id == selected!!.id }) {
+                    base = base + selected!!
+                }
                 fun rank(t: PoseTemplate): Int {
                     var r = 0
-                    if (scene != null && scene!!.displayName in t.tags) r += 2
+                    if (verdict.coarse != null && t.tags.any { it in verdict.coarse!!.poseTags }) r += 2
                     if (shot != null && t.shotType == shot) r += 1
                     return r
                 }
-                templates.sortedByDescending { rank(it) }
+                base.sortedByDescending { rank(it) }
             }
             TemplateCarousel(
                 templates = ordered,

@@ -83,7 +83,8 @@ fun LevelLineOverlay(tilt: Tilt, modifier: Modifier = Modifier) {
 /**
  * 骨架叠加层:
  * - 用户实时骨架: 分析帧坐标经 FILL_CENTER 裁剪映射到屏幕
- * - 模板参考虚线骨架: 居中方形区域, 形状引导 (镜像开关支持左右对调)
+ * - 模板参考虚线骨架: 动态锚定到被摄者 —— 髋关节对齐参考框中心,
+ *   肩宽等比缩放 (1:1 姿势比对), 无人时回退居中方框
  */
 @Composable
 fun PoseSkeletonOverlay(
@@ -97,33 +98,81 @@ fun PoseSkeletonOverlay(
 ) {
     val color = GuideColors.of(state)
     Canvas(modifier = modifier) {
-        // 用户实时骨架
+        // 分析帧 → 屏幕坐标 (FILL_CENTER) 的变换
+        var userTransform: ((Float, Float) -> Offset)? = null
         if (userJoints != null && frameWidth > 0f && frameHeight > 0f) {
             val scale = maxOf(size.width / frameWidth, size.height / frameHeight)
             val dx = (size.width - frameWidth * scale) / 2f
             val dy = (size.height - frameHeight * scale) / 2f
+            val tx: (Float, Float) -> Offset = { x, y ->
+                Offset(dx + x * frameWidth * scale, dy + y * frameHeight * scale)
+            }
+            userTransform = tx
             drawSkeleton(
                 joints = userJoints.mapValues { Joint(it.key, it.value.x, it.value.y) },
-                transform = { x, y -> Offset(dx + x * frameWidth * scale, dy + y * frameHeight * scale) },
+                transform = tx,
                 color = color.copy(alpha = 0.95f),
                 strokeWidth = 5f,
                 dashed = false,
                 headRadius = 10f,
             )
         }
-        // 模板参考虚线骨架 (居中方框)
+
+        // 模板参考虚线骨架 (随选中卡片动态变化)
         if (template != null) {
-            val side = min(size.width, size.height * 0.82f) * 0.92f
-            val left = (size.width - side) / 2f
-            val top = (size.height - side) / 2f - size.height * 0.03f
             val pts = if (mirrored) {
                 template.joints.mapValues { Joint(it.key, 1f - it.value.x, it.value.y) }
             } else {
                 template.joints
             }
+
+            // 自适应: 髋中心锚点 + 肩宽比例缩放
+            var side: Float? = null
+            var left: Float? = null
+            var top: Float? = null
+            val tx = userTransform
+            if (userJoints != null && tx != null) {
+                val vis = 0.4f
+                val hipL = userJoints[23]?.takeIf { it.visibility >= vis }
+                val hipR = userJoints[24]?.takeIf { it.visibility >= vis }
+                val shL = userJoints[11]?.takeIf { it.visibility >= vis }
+                val shR = userJoints[12]?.takeIf { it.visibility >= vis }
+                val tplShL = pts[11]
+                val tplShR = pts[12]
+                if (hipL != null && hipR != null && shL != null && shR != null &&
+                    tplShL != null && tplShR != null
+                ) {
+                    // 屏幕空间肩宽
+                    val a = tx(shL.x, shL.y)
+                    val b = tx(shR.x, shR.y)
+                    val shoulderPx = kotlin.math.hypot(a.x - b.x, a.y - b.y)
+                    // 模板空间肩宽 (归一化单位)
+                    val tplShoulder = kotlin.math.hypot(tplShL.x - tplShR.x, tplShL.y - tplShR.y)
+                    if (shoulderPx > 24f && tplShoulder > 1e-3f) {
+                        side = (shoulderPx / tplShoulder)
+                            .coerceIn(size.minDimension * 0.30f, size.minDimension * 1.6f)
+                        // 模板髋中心
+                        val hcx = (pts[23]!!.x + pts[24]!!.x) / 2f
+                        val hcy = (pts[23]!!.y + pts[24]!!.y) / 2f
+                        // 用户髋中心 (屏幕坐标)
+                        val hipCenter = tx((hipL.x + hipR.x) / 2f, (hipL.y + hipR.y) / 2f)
+                        left = hipCenter.x - hcx * side
+                        top = hipCenter.y - hcy * side
+                    }
+                }
+            }
+            // 无人/关键点不足 → 居中默认框
+            if (side == null || left == null || top == null) {
+                side = min(size.width, size.height * 0.82f) * 0.92f
+                left = (size.width - side) / 2f
+                top = (size.height - side) / 2f - size.height * 0.03f
+            }
+            val s = side
+            val l = left
+            val t = top
             drawSkeleton(
                 joints = pts,
-                transform = { x, y -> Offset(left + x * side, top + y * side) },
+                transform = { x, y -> Offset(l + x * s, t + y * s) },
                 color = color.copy(alpha = 0.6f),
                 strokeWidth = 3.5f,
                 dashed = true,
