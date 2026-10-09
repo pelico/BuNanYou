@@ -11,8 +11,8 @@ android {
         applicationId = "com.aicompose"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.5.0"
+        versionCode = 7
+        versionName = "0.5.1"
         ndk {
             // 只打包 arm64-v8a, 大幅缩减 APK 体积 (现代安卓手机主流架构)
             abiFilters += listOf("arm64-v8a")
@@ -86,8 +86,11 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    // MediaPipe Pose Landmarker — 端侧人体骨骼关键点 (替代 GAIC/Places365)
+    // MediaPipe Pose Landmarker — 端侧人体骨骼关键点
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
+
+    // ML Kit 图像标签 — 端侧场景识别 (仅用于姿势软推荐, 离线)
+    implementation("com.google.mlkit:image-labeling:17.0.8")
 
     // 协程
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

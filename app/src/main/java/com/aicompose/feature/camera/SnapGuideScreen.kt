@@ -69,6 +69,8 @@ import com.aicompose.core.guide.DetectedJoint
 import com.aicompose.core.guide.PoseLandmarkerManager
 import com.aicompose.core.guide.PoseTemplate
 import com.aicompose.core.guide.PoseTemplateCatalog
+import com.aicompose.core.guide.SceneDetector
+import com.aicompose.core.guide.SceneTag
 import com.aicompose.core.guide.Tilt
 import com.aicompose.core.guide.TiltSensor
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -78,6 +80,9 @@ import kotlinx.coroutines.delay
 
 /** 骨骼检测限流 ~15fps */
 private const val FRAME_INTERVAL_MS = 66L
+
+/** 场景识别限流 ~1.5s */
+private const val SCENE_INTERVAL_MS = 1500L
 
 /**
  * SnapGuide 主取景页:
@@ -114,8 +119,11 @@ fun SnapGuideScreen() {
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var toast by remember { mutableStateOf<String?>(null) }
     var lastHapticAt by remember { mutableLongStateOf(0L) }
+    var scene by remember { mutableStateOf<SceneTag?>(null) }
+    var manualPick by remember { mutableStateOf(false) }
 
     val templates = remember { PoseTemplateCatalog.load(context) }
+    val sceneDetector = remember { SceneDetector(context) }
     val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
     val analyzerExecutor = remember { Executors.newSingleThreadExecutor() }
     val landmarker = remember {
@@ -134,6 +142,7 @@ fun SnapGuideScreen() {
     DisposableEffect(Unit) {
         onDispose {
             landmarker.close()
+            sceneDetector.close()
             analyzerExecutor.shutdown()
         }
     }
@@ -171,9 +180,37 @@ fun SnapGuideScreen() {
         }
     }
 
-    // ---------- 引导文案 ----------
+    // ---------- 景别 (自动推荐与引导文案共用) ----------
     val shot = pose?.let { CompositionEngine.detectShotType(it) }
     val personRatio = pose?.let { CompositionEngine.personHeight(it) }
+
+    // ---------- 场景 → 自动推荐姿势 ----------
+    // 软推荐: 场景识别只改变"推荐哪些姿势", 不拦截拍照;
+    // 用户手动选过的姿势 (manualPick) 不会被自动覆盖, 点掉选中后恢复自动。
+    LaunchedEffect(scene) {
+        if (scene == null || manualPick) return@LaunchedEffect
+        val candidates = templates.filter { scene!!.displayName in it.tags }
+        if (candidates.isEmpty()) return@LaunchedEffect
+        val pool = if (shot != null && candidates.any { it.shotType == shot }) {
+            candidates.filter { it.shotType == shot }
+        } else {
+            candidates
+        }
+        // 有人时优先推荐与当前姿态最接近的, 没人时取场景第一位
+        val best = if (pose != null) {
+            pool.maxByOrNull { CompositionEngine.similarity(pose!!, it, aspect).score }
+                ?: pool.first()
+        } else {
+            pool.first()
+        }
+        if (selected?.id != best.id) {
+            selected = best
+            scoreEma = Float.NaN
+            toast = "${scene!!.emoji} 识别到${scene!!.displayName}场景，已自动推荐「${best.name}」"
+        }
+    }
+
+    // ---------- 引导文案 ----------
     val smoothedSim = sim?.copy(score = if (scoreEma.isNaN()) sim.score else scoreEma)
     val guidance = CompositionEngine.guidance(
         personVisible = pose != null,
@@ -219,6 +256,7 @@ fun SnapGuideScreen() {
                 var reuseRaw: Bitmap? = null
                 var reuseRot: Bitmap? = null
                 var lastTs = 0L
+                var lastSceneTs = 0L
                 analysis.setAnalyzer(analyzerExecutor) { proxy ->
                     try {
                         val now = System.currentTimeMillis()
@@ -267,6 +305,14 @@ fun SnapGuideScreen() {
                         if (frame.width != rotated.width || frame.height != rotated.height) {
                             frame = IntSize(rotated.width, rotated.height)
                         }
+
+                        // 场景识别 (独立限流): 拷贝一份给 ML Kit, 避免与复用位图冲突
+                        if (now - lastSceneTs > SCENE_INTERVAL_MS) {
+                            lastSceneTs = now
+                            val sceneCopy = Bitmap.createBitmap(rotated)
+                            sceneDetector.classifyAsync(sceneCopy) { s -> scene = s }
+                        }
+
                         landmarker.detectAsync(BitmapImageBuilder(rotated).build(), now)
                     } catch (_: Throwable) {
                         // 单帧失败直接丢弃, 不影响预览
@@ -352,7 +398,7 @@ fun SnapGuideScreen() {
         )
         LevelLineOverlay(tilt, Modifier.fillMaxSize())
 
-        // 顶部: 水平角 + 镜像 + 姿态库
+        // 顶部: 场景/水平角 + 镜像 + 姿态库
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
@@ -360,16 +406,31 @@ fun SnapGuideScreen() {
                 .align(Alignment.TopCenter)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
-            Surface(
-                color = Color.Black.copy(alpha = 0.45f),
-                shape = RoundedCornerShape(8.dp),
-            ) {
-                Text(
-                    text = "水平 %.1f°".format(tilt.rollDeg),
-                    color = if (tilt.level) GuideColors.MATCHED else Color.White,
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.45f),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(
+                        text = "水平 %.1f°".format(tilt.rollDeg),
+                        color = if (tilt.level) GuideColors.MATCHED else Color.White,
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    )
+                }
+                scene?.let { s ->
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.45f),
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text(
+                            text = "${s.emoji} ${s.displayName}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        )
+                    }
+                }
             }
             Spacer(Modifier.weight(1f))
             IconButton(onClick = { mirrored = !mirrored }) {
@@ -439,16 +500,27 @@ fun SnapGuideScreen() {
                 }
             }
 
-            // 模板栏: 检测到的景别排前面
-            val ordered = remember(shot, selected) {
-                if (shot == null) templates
-                else templates.sortedByDescending { it.shotType == shot }
+            // 模板栏: 场景匹配 > 景别匹配 排前面
+            val ordered = remember(scene, shot) {
+                fun rank(t: PoseTemplate): Int {
+                    var r = 0
+                    if (scene != null && scene!!.displayName in t.tags) r += 2
+                    if (shot != null && t.shotType == shot) r += 1
+                    return r
+                }
+                templates.sortedByDescending { rank(it) }
             }
             TemplateCarousel(
                 templates = ordered,
                 selectedId = selected?.id,
                 onSelect = { t ->
-                    selected = if (selected?.id == t.id) null else t
+                    if (selected?.id == t.id) {
+                        selected = null
+                        manualPick = false   // 取消选择后恢复自动推荐
+                    } else {
+                        selected = t
+                        manualPick = true    // 手动选择不被自动覆盖
+                    }
                     scoreEma = Float.NaN
                 },
             )
@@ -480,7 +552,10 @@ fun SnapGuideScreen() {
             TemplateLibrarySheet(
                 templates = templates,
                 selectedId = selected?.id,
-                onSelect = { selected = it },
+                onSelect = {
+                    selected = it
+                    manualPick = true
+                },
                 onDismiss = { showLibrary = false },
             )
         }
